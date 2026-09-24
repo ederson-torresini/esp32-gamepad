@@ -1,302 +1,374 @@
 """
-MicroPython BLE HID Gamepad example for ESP32 (NodeMCU-32S).
+BLE HID Gamepad for NodeMCU ESP32 (MicroPython)
 
-This uses a BLE HID Gamepad service so that browsers implementing the
-Gamepad Web API (https://developer.mozilla.org/en-US/docs/Web/API/Gamepad_API)
-can detect it once paired as a BLE HID device (via OS Bluetooth stack).
+Controls : D-pad (hat switch) + A, B, X, Y, L, R, Select, Start
+Modes    :
+  PAIRING - advertises to anyone, wipes the old bond, and accepts ONE new device.
+            Once that device bonds, the gamepad switches to GAMING mode.
+  GAMING  - only the bonded device is accepted. Any other device is refused
+            (its pairing keys are rejected and the link is dropped).
 
-Steps performed:
- 1. Enter BLE pairing/advertising mode (discoverable) using bonding + IO capability.
- 2. Once a central (e.g. your laptop/phone/PC browser host) connects & pairs,
-    the device exposes a standard HID Gamepad report descriptor.
- 3. After pairing, we continuously send button/axis updates so the browser's
-    Gamepad API (navigator.getGamepads()) reflects our virtual gamepad.
+Enter PAIRING mode at any time by holding START + SELECT for 3 seconds.
+If no bond is stored (first boot), the gamepad starts in PAIRING mode.
 
-Wiring (optional, for physical testing):
-  - Buttons on GPIO pins pulled up internally, active LOW when pressed.
-  - Two potentiometers (or joystick module) on ADC pins for X/Y axes.
+LED (GPIO2): fast blink = pairing, slow blink = gaming/waiting, solid = connected.
 
-NOTE: Requires a MicroPython build with bluetooth (ubluetooth) support.
+Wiring: every button between its GPIO and GND (internal pull-ups are used).
 """
 
 import bluetooth
+import binascii
+import json
+import os
 import struct
-import time
-from machine import Pin, ADC
+from machine import Pin
+from micropython import const
+from time import sleep_ms, ticks_ms, ticks_diff
 
-# ---------------------------------------------------------------------------
-# HID Report Descriptor - Standard Gamepad
-# 8 buttons + 2 axes (X, Y), each axis 8-bit signed (-127..127)
-# ---------------------------------------------------------------------------
-_HID_REPORT_DESCRIPTOR = bytes(
-    [
-        0x05,
-        0x01,  # Usage Page (Generic Desktop)
-        0x09,
-        0x05,  # Usage (Gamepad)
-        0xA1,
-        0x01,  # Collection (Application)
-        0xA1,
-        0x00,  #   Collection (Physical)
-        # --- Buttons (8) ---
-        0x05,
-        0x09,  #   Usage Page (Button)
-        0x19,
-        0x01,  #   Usage Minimum (Button 1)
-        0x29,
-        0x08,  #   Usage Maximum (Button 8)
-        0x15,
-        0x00,  #   Logical Minimum (0)
-        0x25,
-        0x01,  #   Logical Maximum (1)
-        0x75,
-        0x01,  #   Report Size (1)
-        0x95,
-        0x08,  #   Report Count (8)
-        0x81,
-        0x02,  #   Input (Data, Var, Abs)
-        # --- Axes X, Y ---
-        0x05,
-        0x01,  #   Usage Page (Generic Desktop)
-        0x09,
-        0x30,  #   Usage (X)
-        0x09,
-        0x31,  #   Usage (Y)
-        0x15,
-        0x81,  #   Logical Minimum (-127)
-        0x25,
-        0x7F,  #   Logical Maximum (127)
-        0x75,
-        0x08,  #   Report Size (8)
-        0x95,
-        0x02,  #   Report Count (2)
-        0x81,
-        0x02,  #   Input (Data, Var, Abs)
-        0xC0,  #  End Collection (Physical)
-        0xC0,  # End Collection (Application)
-    ]
+# ----------------------------------------------------------------- config ---
+DEVICE_NAME = "ESP32 Gamepad"
+
+# D-pad
+PIN_UP, PIN_DOWN, PIN_LEFT, PIN_RIGHT = 32, 33, 25, 26
+
+# Buttons: order defines the HID button number (bit 0 = button 1, ...)
+BUTTON_PINS = {
+    "A": 16,
+    "B": 17,
+    "X": 18,
+    "Y": 19,
+    "L": 21,
+    "R": 22,
+    "SELECT": 23,
+    "START": 4,
+}
+BUTTON_ORDER = ("A", "B", "X", "Y", "L", "R", "SELECT", "START")
+
+LED_PIN = 2
+PAIR_COMBO_MS = 3000        # hold Start+Select this long to enter pairing mode
+UNBONDED_TIMEOUT_MS = 30000  # drop connections that don't finish bonding
+SECRETS_FILE = "bonds.json"
+
+# ------------------------------------------------------------- BLE consts ---
+_IRQ_CENTRAL_CONNECT = const(1)
+_IRQ_CENTRAL_DISCONNECT = const(2)
+_IRQ_ENCRYPTION_UPDATE = const(28)
+_IRQ_GET_SECRET = const(29)
+_IRQ_SET_SECRET = const(30)
+
+_FLAG_READ = const(0x0002)
+_FLAG_WRITE_NO_RESPONSE = const(0x0004)
+_FLAG_NOTIFY = const(0x0010)
+_FLAG_READ_ENCRYPTED = const(0x0200)
+
+_ADV_TYPE_FLAGS = const(0x01)
+_ADV_TYPE_UUID16_COMPLETE = const(0x03)
+_ADV_TYPE_NAME = const(0x09)
+_ADV_TYPE_APPEARANCE = const(0x19)
+
+PAIRING = const(0)
+GAMING = const(1)
+
+# HID report descriptor: 8 buttons + 1 hat switch (2-byte report, no report ID)
+HID_REPORT_MAP = bytes((
+    0x05, 0x01,        # Usage Page (Generic Desktop)
+    0x09, 0x05,        # Usage (Game Pad)
+    0xA1, 0x01,        # Collection (Application)
+    0x05, 0x09,        #   Usage Page (Button)
+    0x19, 0x01,        #   Usage Minimum (1)
+    0x29, 0x08,        #   Usage Maximum (8)
+    0x15, 0x00,        #   Logical Minimum (0)
+    0x25, 0x01,        #   Logical Maximum (1)
+    0x75, 0x01,        #   Report Size (1)
+    0x95, 0x08,        #   Report Count (8)
+    0x81, 0x02,        #   Input (Data, Var, Abs)
+    0x05, 0x01,        #   Usage Page (Generic Desktop)
+    0x09, 0x39,        #   Usage (Hat switch)
+    0x15, 0x01,        #   Logical Minimum (1)
+    0x25, 0x08,        #   Logical Maximum (8)
+    0x35, 0x00,        #   Physical Minimum (0)
+    0x46, 0x3B, 0x01,  #   Physical Maximum (315)
+    0x65, 0x14,        #   Unit (Degrees)
+    0x75, 0x04,        #   Report Size (4)
+    0x95, 0x01,        #   Report Count (1)
+    0x81, 0x42,        #   Input (Data, Var, Abs, Null state)
+    0x75, 0x04,        #   Report Size (4)
+    0x95, 0x01,        #   Report Count (1)
+    0x81, 0x03,        #   Input (Const) - padding
+    0xC0,              # End Collection
+))
+
+# Hat values: 0 = centered, 1 = N, 2 = NE, 3 = E, 4 = SE, 5 = S, 6 = SW, 7 = W, 8 = NW
+# index bits: up=1, right=2, down=4, left=8
+HAT_TABLE = {1: 1, 3: 2, 2: 3, 6: 4, 4: 5, 12: 6, 8: 7, 9: 8}
+
+# -------------------------------------------------------------- hardware ---
+led = Pin(LED_PIN, Pin.OUT)
+dpad = [Pin(p, Pin.IN, Pin.PULL_UP) for p in (PIN_UP, PIN_RIGHT, PIN_DOWN, PIN_LEFT)]
+buttons = [Pin(BUTTON_PINS[n], Pin.IN, Pin.PULL_UP) for n in BUTTON_ORDER]
+BIT_SELECT = 1 << BUTTON_ORDER.index("SELECT")
+BIT_START = 1 << BUTTON_ORDER.index("START")
+
+
+def read_inputs():
+    """Return (button_bits, hat_value); opposite d-pad directions cancel out."""
+    bits = 0
+    for i, pin in enumerate(buttons):
+        if not pin.value():
+            bits |= 1 << i
+    up, right, down, left = [not p.value() for p in dpad]
+    if up and down:
+        up = down = False
+    if left and right:
+        left = right = False
+    idx = up | (right << 1) | (down << 2) | (left << 3)
+    return bits, HAT_TABLE.get(idx, 0)
+
+
+# ----------------------------------------------------------- bond storage ---
+secrets = {}
+
+
+def load_secrets():
+    try:
+        with open(SECRETS_FILE) as f:
+            for sec_type, key, value in json.load(f):
+                secrets[(sec_type, binascii.a2b_base64(key))] = binascii.a2b_base64(value)
+    except Exception:
+        pass
+
+
+def save_secrets():
+    try:
+        with open(SECRETS_FILE, "w") as f:
+            json.dump(
+                [(t, binascii.b2a_base64(k).decode(), binascii.b2a_base64(v).decode())
+                 for (t, k), v in secrets.items()],
+                f,
+            )
+    except Exception as e:
+        print("save_secrets failed:", e)
+
+
+def clear_bonds():
+    secrets.clear()
+    try:
+        os.remove(SECRETS_FILE)
+    except OSError:
+        pass
+
+
+# -------------------------------------------------------------- BLE setup ---
+def _adv_field(adv_type, value):
+    return struct.pack("BB", len(value) + 1, adv_type) + value
+
+
+ADV_DATA = (
+    _adv_field(_ADV_TYPE_FLAGS, b"\x06")
+    + _adv_field(_ADV_TYPE_NAME, DEVICE_NAME.encode())
+    + _adv_field(_ADV_TYPE_UUID16_COMPLETE, struct.pack("<H", 0x1812))
+    + _adv_field(_ADV_TYPE_APPEARANCE, struct.pack("<H", 0x03C4))  # gamepad
 )
 
-# BLE HID constants
-_IRQ_CENTRAL_CONNECT = 1
-_IRQ_CENTRAL_DISCONNECT = 2
-_IRQ_GATTS_WRITE = 3
-_IRQ_ENCRYPTION_UPDATE = 28
-
-_FLAG_READ = 0x0002
-_FLAG_WRITE = 0x0008
-_FLAG_NOTIFY = 0x0010
-_FLAG_READ_ENCRYPTED = 0x0200
-
-_HID_SERVICE_UUID = bluetooth.UUID(0x1812)
-_HID_INFO_UUID = bluetooth.UUID(0x2A4A)
-_HID_REPORT_MAP_UUID = bluetooth.UUID(0x2A4B)
-_HID_CONTROL_POINT_UUID = bluetooth.UUID(0x2A4C)
-_HID_REPORT_UUID = bluetooth.UUID(0x2A4D)
-_HID_PROTOCOL_MODE_UUID = bluetooth.UUID(0x2A4E)
-
-_REPORT_REF_DESC_UUID = bluetooth.UUID(0x2908)
-
-_HID_INFO = struct.pack("<HBB", 0x0111, 0x00, 0x02)  # bcdHID, country code, flags
-
-_HID_SERVICE = (
-    _HID_SERVICE_UUID,
+UUID = bluetooth.UUID
+SERVICES = (
     (
-        (_HID_INFO_UUID, _FLAG_READ),
-        (_HID_REPORT_MAP_UUID, _FLAG_READ),
-        (_HID_CONTROL_POINT_UUID, _FLAG_WRITE),
+        UUID(0x1812),  # Human Interface Device
         (
-            _HID_REPORT_UUID,
-            _FLAG_READ | _FLAG_NOTIFY | _FLAG_READ_ENCRYPTED,
-            ((_REPORT_REF_DESC_UUID, _FLAG_READ),),
+            (UUID(0x2A4A), _FLAG_READ),                      # HID information
+            (UUID(0x2A4B), _FLAG_READ),                      # Report map
+            (UUID(0x2A4C), _FLAG_WRITE_NO_RESPONSE),         # Control point
+            (
+                UUID(0x2A4D),                                # Report (input)
+                _FLAG_READ | _FLAG_READ_ENCRYPTED | _FLAG_NOTIFY,
+                ((UUID(0x2908), _FLAG_READ),),               # Report reference
+            ),
+            (UUID(0x2A4E), _FLAG_READ | _FLAG_WRITE_NO_RESPONSE),  # Protocol mode
         ),
-        (_HID_PROTOCOL_MODE_UUID, _FLAG_READ | _FLAG_WRITE),
+    ),
+    (
+        UUID(0x180A),  # Device Information
+        (
+            (UUID(0x2A29), _FLAG_READ),  # Manufacturer name
+            (UUID(0x2A50), _FLAG_READ),  # PnP ID
+        ),
+    ),
+    (
+        UUID(0x180F),  # Battery
+        ((UUID(0x2A19), _FLAG_READ | _FLAG_NOTIFY),),
     ),
 )
 
-_BOARD_LED_PIN = 2
+ble = bluetooth.BLE()
+ble.active(True)
+ble.config(gap_name=DEVICE_NAME)
+ble.config(bond=True, mitm=False, io=3)  # 3 = no input / no output ("Just Works")
+try:
+    ble.config(le_secure=True)
+except Exception:
+    pass
+
+load_secrets()
+mode = GAMING if secrets else PAIRING
+
+conn = None            # current connection handle
+conn_since = 0         # ticks when the current connection started
+link_ready = False     # True once the link is encrypted AND bonded
+
+((h_info, h_map, h_ctrl, h_report, h_report_ref, h_proto),
+ (h_mfr, h_pnp),
+ (h_batt,)) = ble.gatts_register_services(SERVICES)
+
+ble.gatts_set_buffer(h_map, len(HID_REPORT_MAP))
+ble.gatts_write(h_info, b"\x11\x01\x00\x02")            # HID 1.11, normally connectable
+ble.gatts_write(h_map, HID_REPORT_MAP)
+ble.gatts_write(h_report, b"\x00\x00")
+ble.gatts_write(h_report_ref, b"\x00\x01")              # report ID 0, input report
+ble.gatts_write(h_proto, b"\x01")                       # report protocol
+ble.gatts_write(h_mfr, b"DIY")
+ble.gatts_write(h_pnp, struct.pack("<BHHH", 0x02, 0x1209, 0x0001, 0x0100))
+ble.gatts_write(h_batt, b"\x64")
 
 
-class BLEGamepad:
-    def __init__(self, name="ESP32-Gamepad"):
-        self._led = Pin(_BOARD_LED_PIN, Pin.OUT)
-        self._led.off()
-        self._ble = bluetooth.BLE()
-        self._ble.active(True)
-        self._ble.irq(self._irq)
-
-        # IO capability: no input/output -> "Just Works" pairing.
-        self._ble.config(bond=True)
-        self._ble.config(le_secure=True)
-        self._ble.config(mitm=False)
-        # Older MicroPython builds do not expose the IO capability constants.
-        # NimBLE's numeric value for "no input/output" is 3.
-        self._ble.config(io=getattr(bluetooth, "IO_CAPABILITY_NO_INPUT_OUTPUT", 3))
-
-        (
-            (
-                self._h_info,
-                self._h_report_map,
-                self._h_control,
-                self._h_report,
-                self._h_report_ref,
-                self._h_protocol,
-            ),
-        ) = self._ble.gatts_register_services((_HID_SERVICE,))
-
-        self._ble.gatts_write(self._h_info, _HID_INFO)
-        self._ble.gatts_write(self._h_report_map, _HID_REPORT_DESCRIPTOR)
-        # Report Reference descriptor: report id 0, report type Input (1)
-        self._ble.gatts_write(self._h_report_ref, struct.pack("<BB", 0, 1))
-        self._ble.gatts_write(self._h_protocol, b"\x01")
-
-        self._connections = set()
-        self._name = name
-        self._advertise()
-
-        # Current gamepad state.
-        self._buttons = 0
-        self._axis_x = 0
-        self._axis_y = 0
-
-    # -----------------------------------------------------------------
-    # BLE event handling
-    # -----------------------------------------------------------------
-    def _irq(self, event, data):
-        if event == _IRQ_CENTRAL_CONNECT:
-            conn_handle, _, _ = data
-            if self._connections:
-                self._ble.gap_disconnect(conn_handle)
-                print("Rejected additional central:", conn_handle)
-                return
-
-            self._connections.add(conn_handle)
-            self._ble.gap_advertise(None)
-            self._led.on()
-            print("Central connected:", conn_handle)
-
-        elif event == _IRQ_CENTRAL_DISCONNECT:
-            conn_handle, _, _ = data
-            self._connections.discard(conn_handle)
-            self._led.value(bool(self._connections))
-            print("Central disconnected:", conn_handle)
-            self._advertise()
-
-        elif event == _IRQ_GATTS_WRITE:
-            conn_handle, attr_handle = data
-            print("Write on handle:", attr_handle)
-
-        elif event == _IRQ_ENCRYPTION_UPDATE:
-            conn_handle, encrypted, authenticated, bonded, key_size = data
-            print(
-                "Encryption update - conn:",
-                conn_handle,
-                "encrypted:",
-                encrypted,
-                "authenticated:",
-                authenticated,
-                "bonded:",
-                bonded,
-            )
-
-    def _advertise(self, interval_us=250000):
-        # Advertise with HID appearance (Gamepad = 0x03C4) so hosts can
-        # identify device type during pairing/scan.
-        name_bytes = self._name.encode()
-        adv_payload = self._build_adv_payload(name_bytes)
-        self._ble.gap_advertise(interval_us, adv_data=adv_payload)
-        print("Advertising as '%s' - enter pairing mode on your host now." % self._name)
-
-    @staticmethod
-    def _build_adv_payload(name_bytes):
-        payload = bytearray()
-
-        def _append(adv_type, value):
-            payload.extend(struct.pack("BB", len(value) + 1, adv_type) + value)
-
-        # Flags: general discoverable, BR/EDR not supported.
-        _append(0x01, struct.pack("B", 0x06))
-        # Appearance: HID Gamepad (0x03C4).
-        _append(0x19, struct.pack("<H", 0x03C4))
-        # Complete list of 16-bit service UUIDs: HID service (0x1812).
-        _append(0x03, struct.pack("<H", 0x1812))
-        # Complete local name.
-        _append(0x09, name_bytes)
-
-        return bytes(payload)
-
-    # -----------------------------------------------------------------
-    # Public API
-    # -----------------------------------------------------------------
-    def is_connected(self):
-        return len(self._connections) > 0
-
-    def set_button(self, index, pressed):
-        """index: 0-7"""
-        if pressed:
-            self._buttons |= 1 << index
-        else:
-            self._buttons &= ~(1 << index)
-
-    def set_axes(self, x, y):
-        """x, y expected in range -127..127"""
-        self._axis_x = max(-127, min(127, x))
-        self._axis_y = max(-127, min(127, y))
-
-    def send_report(self):
-        if not self._connections:
-            return
-        report = struct.pack("<Bbb", self._buttons & 0xFF, self._axis_x, self._axis_y)
-        for conn_handle in self._connections:
-            try:
-                self._ble.gatts_notify(conn_handle, self._h_report, report)
-            except OSError:
-                pass
+def start_advertising():
+    try:
+        ble.gap_advertise(None)
+        interval = 30_000 if mode == PAIRING else 100_000
+        ble.gap_advertise(interval, adv_data=ADV_DATA, connectable=True)
+    except OSError as e:
+        print("advertise failed:", e)
 
 
-# ---------------------------------------------------------------------------
-# Example usage: read physical buttons/joystick and stream to connected host
-# ---------------------------------------------------------------------------
+def irq(event, data):
+    global conn, conn_since, link_ready, mode
+
+    if event == _IRQ_CENTRAL_CONNECT:
+        conn, _addr_type, _addr = data
+        conn_since = ticks_ms()
+        link_ready = False
+
+    elif event == _IRQ_CENTRAL_DISCONNECT:
+        conn = None
+        link_ready = False
+        start_advertising()
+
+    elif event == _IRQ_ENCRYPTION_UPDATE:
+        _handle, encrypted, _auth, bonded, _key_size = data
+        link_ready = bool(encrypted and bonded)
+        if link_ready and mode == PAIRING:
+            mode = GAMING  # first device bonded -> lock to it
+            print("Bonded. Switched to GAMING mode.")
+
+    elif event == _IRQ_GET_SECRET:
+        sec_type, index, key = data
+        if key is None:
+            i = 0
+            for (t, _k), value in secrets.items():
+                if t == sec_type:
+                    if i == index:
+                        return value
+                    i += 1
+            return None
+        return secrets.get((sec_type, bytes(key)))
+
+    elif event == _IRQ_SET_SECRET:
+        sec_type, key, value = data
+        key = (sec_type, bytes(key))
+        if value is None:
+            if key in secrets:
+                del secrets[key]
+                save_secrets()
+                return True
+            return False
+        # In GAMING mode never learn keys from a new device.
+        if mode == GAMING and key not in secrets:
+            return False
+        secrets[key] = bytes(value)
+        save_secrets()
+        return True
 
 
-def _map_adc_to_signed(adc_value, in_min=0, in_max=4095):
-    """Map a 12-bit ADC reading (0-4095) to signed range -127..127."""
-    centered = adc_value - (in_max // 2)
-    scale = 127 / (in_max // 2)
-    return int(max(-127, min(127, centered * scale)))
+ble.irq(irq)
+
+
+def enter_pairing_mode():
+    global mode
+    print("Entering PAIRING mode (old bond erased)")
+    mode = PAIRING
+    clear_bonds()
+    if conn is not None:
+        try:
+            ble.gap_disconnect(conn)  # disconnect IRQ restarts advertising
+        except OSError:
+            start_advertising()
+    else:
+        start_advertising()
+
+
+def send_report(bits, hat):
+    if conn is None or not link_ready:
+        return
+    try:
+        ble.gatts_write(h_report, bytes((bits, hat)))
+        ble.gatts_notify(conn, h_report)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------- main loop ---
+def update_led(now):
+    if conn is not None and link_ready:
+        led.value(1)
+    elif mode == PAIRING:
+        led.value((now // 100) % 2)          # fast blink
+    else:
+        led.value(1 if (now % 1500) < 100 else 0)  # short blink every 1.5 s
 
 
 def main():
-    gamepad = BLEGamepad(name="ESP32-Gamepad")
+    global conn
+    start_advertising()
+    print("Started in", "PAIRING" if mode == PAIRING else "GAMING", "mode")
 
-    # --- Optional physical controls ---
-    NUM_BUTTONS = 8
-    button_pins = []
-    for gpio in (13, 12, 14, 27, 26, 25, 33, 32):
-        p = Pin(gpio, Pin.IN, Pin.PULL_UP)
-        button_pins.append(p)
-
-    adc_x = ADC(Pin(34))
-    adc_x.atten(ADC.ATTN_11DB)
-    adc_y = ADC(Pin(35))
-    adc_y.atten(ADC.ATTN_11DB)
-
-    print("Waiting for BLE pairing... put your host in pairing/scan mode.")
+    state = (0, 0)
+    candidate = state
+    stable = 0
+    combo_start = None
+    combo_fired = False
 
     while True:
-        if gamepad.is_connected():
-            for i in range(NUM_BUTTONS):
-                pressed = button_pins[i].value() == 0  # active low
-                gamepad.set_button(i, pressed)
+        now = ticks_ms()
 
-            x = _map_adc_to_signed(adc_x.read())
-            y = _map_adc_to_signed(adc_y.read())
-            gamepad.set_axes(x, y)
+        # Debounced input (state must be stable for 3 samples = ~15 ms)
+        raw = read_inputs()
+        if raw == candidate:
+            stable += 1
+        else:
+            candidate, stable = raw, 0
+        if stable >= 3 and candidate != state:
+            state = candidate
+            send_report(*state)
 
-            gamepad.send_report()
+        # Start + Select held -> pairing mode
+        if (state[0] & (BIT_START | BIT_SELECT)) == (BIT_START | BIT_SELECT):
+            if combo_start is None:
+                combo_start = now
+            elif not combo_fired and ticks_diff(now, combo_start) >= PAIR_COMBO_MS:
+                combo_fired = True
+                enter_pairing_mode()
+        else:
+            combo_start, combo_fired = None, False
 
-        time.sleep_ms(20)  # ~50 Hz report rate
+        # Drop connections that never complete bonding (unknown devices)
+        if conn is not None and not link_ready:
+            if ticks_diff(now, conn_since) > UNBONDED_TIMEOUT_MS:
+                try:
+                    ble.gap_disconnect(conn)
+                except OSError:
+                    pass
+
+        update_led(now)
+        sleep_ms(5)
 
 
-if __name__ == "__main__":
-    main()
+main()
