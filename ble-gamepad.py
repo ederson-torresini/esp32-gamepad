@@ -42,10 +42,10 @@ BUTTON_PINS = {
     "SELECT": 23,
     "START": 4,
 }
-BUTTON_ORDER = ("A", "B", "X", "Y", "L", "R", "SELECT", "START")
+BUTTON_ORDER = ("B", "A", "Y", "X", "L", "R", "SELECT", "START")
 
 LED_PIN = 2
-PAIR_COMBO_MS = 3000        # hold Start+Select this long to enter pairing mode
+PAIR_COMBO_MS = 3000  # hold Start+Select this long to enter pairing mode
 UNBONDED_TIMEOUT_MS = 30000  # drop connections that don't finish bonding
 SECRETS_FILE = "bonds.json"
 
@@ -69,34 +69,82 @@ _ADV_TYPE_APPEARANCE = const(0x19)
 PAIRING = const(0)
 GAMING = const(1)
 
-# HID report descriptor: 8 buttons + 1 hat switch (2-byte report, no report ID)
-HID_REPORT_MAP = bytes((
-    0x05, 0x01,        # Usage Page (Generic Desktop)
-    0x09, 0x05,        # Usage (Game Pad)
-    0xA1, 0x01,        # Collection (Application)
-    0x05, 0x09,        #   Usage Page (Button)
-    0x19, 0x01,        #   Usage Minimum (1)
-    0x29, 0x08,        #   Usage Maximum (8)
-    0x15, 0x00,        #   Logical Minimum (0)
-    0x25, 0x01,        #   Logical Maximum (1)
-    0x75, 0x01,        #   Report Size (1)
-    0x95, 0x08,        #   Report Count (8)
-    0x81, 0x02,        #   Input (Data, Var, Abs)
-    0x05, 0x01,        #   Usage Page (Generic Desktop)
-    0x09, 0x39,        #   Usage (Hat switch)
-    0x15, 0x01,        #   Logical Minimum (1)
-    0x25, 0x08,        #   Logical Maximum (8)
-    0x35, 0x00,        #   Physical Minimum (0)
-    0x46, 0x3B, 0x01,  #   Physical Maximum (315)
-    0x65, 0x14,        #   Unit (Degrees)
-    0x75, 0x04,        #   Report Size (4)
-    0x95, 0x01,        #   Report Count (1)
-    0x81, 0x42,        #   Input (Data, Var, Abs, Null state)
-    0x75, 0x04,        #   Report Size (4)
-    0x95, 0x01,        #   Report Count (1)
-    0x81, 0x03,        #   Input (Const) - padding
-    0xC0,              # End Collection
-))
+# HID report descriptor: 8 buttons (SNES-style) + 1 hat switch, 2-byte report.
+# Button usages are chosen so Android maps them to:
+#   1->A, 2->B, 4->X, 5->Y, 7->L1, 8->R1, 11->SELECT, 12->START
+# (usages 3, 6, 9, 10 = C, Z, L2, R2 are deliberately skipped)
+HID_REPORT_MAP = bytes(
+    (
+        0x05,
+        0x01,  # Usage Page (Generic Desktop)
+        0x09,
+        0x05,  # Usage (Game Pad)
+        0xA1,
+        0x01,  # Collection (Application)
+        0x05,
+        0x09,  #   Usage Page (Button)
+        0x15,
+        0x00,  #   Logical Minimum (0)
+        0x25,
+        0x01,  #   Logical Maximum (1)
+        0x75,
+        0x01,  #   Report Size (1)
+        0x95,
+        0x02,  #   Report Count (2)
+        0x19,
+        0x01,
+        0x29,
+        0x02,
+        0x81,
+        0x02,  # B, A
+        0x19,
+        0x04,
+        0x29,
+        0x05,
+        0x81,
+        0x02,  # X, Y
+        0x19,
+        0x07,
+        0x29,
+        0x08,
+        0x81,
+        0x02,  # L1, R1
+        0x19,
+        0x0B,
+        0x29,
+        0x0C,
+        0x81,
+        0x02,  # SELECT, START
+        0x05,
+        0x01,  #   Usage Page (Generic Desktop)
+        0x09,
+        0x39,  #   Usage (Hat switch)
+        0x15,
+        0x01,  #   Logical Minimum (1)
+        0x25,
+        0x08,  #   Logical Maximum (8)
+        0x35,
+        0x00,  #   Physical Minimum (0)
+        0x46,
+        0x3B,
+        0x01,  #   Physical Maximum (315)
+        0x65,
+        0x14,  #   Unit (Degrees)
+        0x75,
+        0x04,  #   Report Size (4)
+        0x95,
+        0x01,  #   Report Count (1)
+        0x81,
+        0x42,  #   Input (Data, Var, Abs, Null state)
+        0x75,
+        0x04,  #   Report Size (4)
+        0x95,
+        0x01,  #   Report Count (1)
+        0x81,
+        0x03,  #   Input (Const) - padding
+        0xC0,  # End Collection
+    )
+)
 
 # Hat values: 0 = centered, 1 = N, 2 = NE, 3 = E, 4 = SE, 5 = S, 6 = SW, 7 = W, 8 = NW
 # index bits: up=1, right=2, down=4, left=8
@@ -133,7 +181,9 @@ def load_secrets():
     try:
         with open(SECRETS_FILE) as f:
             for sec_type, key, value in json.load(f):
-                secrets[(sec_type, binascii.a2b_base64(key))] = binascii.a2b_base64(value)
+                secrets[(sec_type, binascii.a2b_base64(key))] = binascii.a2b_base64(
+                    value
+                )
     except Exception:
         pass
 
@@ -142,8 +192,14 @@ def save_secrets():
     try:
         with open(SECRETS_FILE, "w") as f:
             json.dump(
-                [(t, binascii.b2a_base64(k).decode(), binascii.b2a_base64(v).decode())
-                 for (t, k), v in secrets.items()],
+                [
+                    (
+                        t,
+                        binascii.b2a_base64(k).decode(),
+                        binascii.b2a_base64(v).decode(),
+                    )
+                    for (t, k), v in secrets.items()
+                ],
                 f,
             )
     except Exception as e:
@@ -175,13 +231,13 @@ SERVICES = (
     (
         UUID(0x1812),  # Human Interface Device
         (
-            (UUID(0x2A4A), _FLAG_READ),                      # HID information
-            (UUID(0x2A4B), _FLAG_READ),                      # Report map
-            (UUID(0x2A4C), _FLAG_WRITE_NO_RESPONSE),         # Control point
+            (UUID(0x2A4A), _FLAG_READ),  # HID information
+            (UUID(0x2A4B), _FLAG_READ),  # Report map
+            (UUID(0x2A4C), _FLAG_WRITE_NO_RESPONSE),  # Control point
             (
-                UUID(0x2A4D),                                # Report (input)
+                UUID(0x2A4D),  # Report (input)
                 _FLAG_READ | _FLAG_READ_ENCRYPTED | _FLAG_NOTIFY,
-                ((UUID(0x2908), _FLAG_READ),),               # Report reference
+                ((UUID(0x2908), _FLAG_READ),),  # Report reference
             ),
             (UUID(0x2A4E), _FLAG_READ | _FLAG_WRITE_NO_RESPONSE),  # Protocol mode
         ),
@@ -211,22 +267,24 @@ except Exception:
 load_secrets()
 mode = GAMING if secrets else PAIRING
 
-conn = None            # current connection handle
-conn_since = 0         # ticks when the current connection started
-link_ready = False     # True once the link is encrypted AND bonded
+conn = None  # current connection handle
+conn_since = 0  # ticks when the current connection started
+link_ready = False  # True once the link is encrypted AND bonded
 
-((h_info, h_map, h_ctrl, h_report, h_report_ref, h_proto),
- (h_mfr, h_pnp),
- (h_batt,)) = ble.gatts_register_services(SERVICES)
+(
+    (h_info, h_map, h_ctrl, h_report, h_report_ref, h_proto),
+    (h_mfr, h_pnp),
+    (h_batt,),
+) = ble.gatts_register_services(SERVICES)
 
 ble.gatts_set_buffer(h_map, len(HID_REPORT_MAP))
-ble.gatts_write(h_info, b"\x11\x01\x00\x02")            # HID 1.11, normally connectable
+ble.gatts_write(h_info, b"\x11\x01\x00\x02")  # HID 1.11, normally connectable
 ble.gatts_write(h_map, HID_REPORT_MAP)
 ble.gatts_write(h_report, b"\x00\x00")
-ble.gatts_write(h_report_ref, b"\x00\x01")              # report ID 0, input report
-ble.gatts_write(h_proto, b"\x01")                       # report protocol
+ble.gatts_write(h_report_ref, b"\x00\x01")  # report ID 0, input report
+ble.gatts_write(h_proto, b"\x01")  # report protocol
 ble.gatts_write(h_mfr, b"DIY")
-ble.gatts_write(h_pnp, struct.pack("<BHHH", 0x02, 0x1209, 0x0001, 0x0100))
+ble.gatts_write(h_pnp, struct.pack("<BHHH", 0x02, 0x1209, 0x0002, 0x0101))  # PnP ID
 ble.gatts_write(h_batt, b"\x64")
 
 
@@ -320,7 +378,7 @@ def update_led(now):
     if conn is not None and link_ready:
         led.value(1)
     elif mode == PAIRING:
-        led.value((now // 100) % 2)          # fast blink
+        led.value((now // 100) % 2)  # fast blink
     else:
         led.value(1 if (now % 1500) < 100 else 0)  # short blink every 1.5 s
 
